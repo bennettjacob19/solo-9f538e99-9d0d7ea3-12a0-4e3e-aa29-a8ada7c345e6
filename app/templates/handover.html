@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>权限交接演练台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <h1>权限交接演练台</h1>
+  <p class="sub">临时值班组退出后，接班人仍要查部署报表：撤回选定的一笔临时授权（连带依赖它的转授），只给仍需读报表且会失去权限的账号补普通 SELECT。所有授权都是数据库里的真实角色与真实授权链。</p>
+  <nav class="nav">
+    <a href="/">行锁演练</a>
+    <a href="/handover" class="active">权限交接</a>
+  </nav>
+</header>
+
+<main>
+{% if error %}<div class="banner banner-error" role="alert">{{ error }}</div>{% endif %}
+{% if message %}<div class="banner banner-ok" role="status">{{ message }}</div>{% endif %}
+
+{% if state %}
+<section class="panel">
+  <div class="panel-head">
+    <h2>样例报表与当前授权链</h2>
+    <span class="mono small">指纹 {{ state.fingerprint[:16] }}…</span>
+  </div>
+  <dl class="kv">
+    <dt>样例表</dt><dd class="mono">{{ state.table }}</dd>
+    <dt>表属主</dt><dd class="mono">{{ state.owner }}</dd>
+    <dt>数据行数</dt><dd>{{ state.row_count }}</dd>
+    <dt>授权链指纹</dt><dd class="mono">{{ state.fingerprint }}</dd>
+  </dl>
+  <table class="tbl">
+    <thead><tr><th>授权者</th><th>被授权者</th><th>权限</th><th>可再转授</th></tr></thead>
+    <tbody>
+    {% for e in state.edges %}
+      <tr>
+        <td class="mono">{{ e.grantor }}</td>
+        <td class="mono">{{ e.grantee }}</td>
+        <td>{{ e.privilege_type }}</td>
+        <td>{% if e.is_grantable %}<span class="tag tag-warn">WITH GRANT OPTION</span>{% else %}—{% endif %}</td>
+      </tr>
+    {% else %}
+      <tr><td colspan="4" class="hint">当前该表没有任何授权记录（仅属主可读）。</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  <p class="hint">授权链 = 从表属主出发、经 WITH GRANT OPTION 逐级转授到报表账号的路径；以上数据实时读自数据库系统目录。</p>
+</section>
+
+<section class="panel">
+  <form method="post" action="/handover/preview">
+  <h2>1. 选择要撤回的临时授权</h2>
+  {% for tg in state.temporary_grants %}
+  <label class="choice {{ 'disabled' if not tg.exists }}">
+    <input type="radio" name="grant_id" value="{{ tg.id }}" required
+           {{ 'checked' if selection.grant_id == tg.id else '' }}
+           {{ 'disabled' if not tg.exists else '' }}>
+    <strong>{{ tg.title }}</strong>
+    <div class="chain">{{ tg.chain_text }}</div>
+    <div class="chain">
+      {% if tg.exists %}
+        当前经此链可读的报表账号：{{ tg.covers | join('、') if tg.covers else '无' }}
+      {% else %}
+        该授权已撤回，不可再选。
+      {% endif %}
+    </div>
+  </label>
+  {% endfor %}
+
+  <h2 class="section-title">2. 勾选交接后仍需读报表的账号</h2>
+  {% for a in state.accounts %}
+  <label class="choice">
+    <input type="checkbox" name="checked" value="{{ a.name }}"
+           {{ 'checked' if a.name in (selection.checked or []) else '' }}>
+    <span class="mono">{{ a.name }}</span>
+    {% if a.can_read %}<span class="tag tag-ok">当前可读</span>{% else %}<span class="tag tag-bad">当前不可读</span>{% endif %}
+    {% if a.direct %}<span class="tag">独立授权</span>{% endif %}
+    {% for c in a.chains %}<span class="tag tag-warn">链 {{ c }}</span>{% endfor %}
+  </label>
+  {% endfor %}
+  <div class="controls">
+    <button type="submit" class="btn btn-primary">预演（不修改库内权限）</button>
+    <span class="hint">预演只读取系统目录，推算撤权影响，不会改动任何授权。</span>
+  </div>
+  </form>
+</section>
+
+{% if preview %}
+<section class="panel">
+  <div class="panel-head">
+    <h2>预演结果（未修改任何权限）</h2>
+    <span class="mono small">指纹 {{ preview.fingerprint[:16] }}…</span>
+  </div>
+  <dl class="kv">
+    <dt>将撤回</dt><dd class="mono">{{ preview.revoke_statement }}</dd>
+    <dt>仅撤权就会失去查询权限的账号</dt>
+    <dd>{% for a in preview.losing %}<span class="tag tag-bad">{{ a }}</span>{% else %}<span class="hint">无</span>{% endfor %}</dd>
+    <dt>本次将补授普通 SELECT 的账号</dt>
+    <dd>{% for a in preview.to_grant %}<span class="tag tag-ok">{{ a }}</span>{% else %}<span class="hint">无</span>{% endfor %}</dd>
+    <dt>已勾选但仍有其他链</dt>
+    <dd>
+      {% for a in preview.kept_by_other_chain %}<span class="tag">{{ a }}</span>{% else %}<span class="hint">无</span>{% endfor %}
+      {% if preview.kept_by_other_chain %}<span class="hint">（独立授权保留，无需补授）</span>{% endif %}
+    </dd>
+    <dt>将失权限但未勾选</dt>
+    <dd>{% for a in preview.losing_unchecked %}<span class="tag tag-bad">{{ a }}</span>{% else %}<span class="hint">无</span>{% endfor %}</dd>
+    {% for stmt in preview.grant_statements %}
+    <dt>补授语句</dt><dd class="mono">{{ stmt }}</dd>
+    {% endfor %}
+  </dl>
+  {% if preview.losing_unchecked %}
+  <div class="banner banner-warn">{{ preview.losing_unchecked | join('、') }} 仅撤权后将无法查询且未勾选补授；如接班人需要，请返回勾选后重新预演。</div>
+  {% endif %}
+  <form method="post" action="/handover/confirm"
+        onsubmit="return confirm('将按预演结果撤权并补授，两者在同一事务生效。确认交接？');">
+    <input type="hidden" name="grant_id" value="{{ preview.grant_id }}">
+    <input type="hidden" name="fingerprint" value="{{ preview.fingerprint }}">
+    {% for a in preview.checked %}<input type="hidden" name="checked" value="{{ a }}">{% endfor %}
+    <div class="controls">
+      <button type="submit" class="btn btn-danger">确认交接（撤权 + 补授，原子生效）</button>
+      <span class="hint">确认时若该表授权链已有变化，本次交接将被拒绝并要求重新预演。</span>
+    </div>
+  </form>
+</section>
+{% endif %}
+
+{% if confirm_result %}
+<section class="verdict verdict-ok">
+  <h3>交接完成</h3>
+  <dl class="kv">
+    <dt>已撤回</dt><dd class="mono">REVOKE SELECT ON {{ state.table }} FROM {{ confirm_result.revoked }} CASCADE（含依赖它的转授）</dd>
+    <dt>已补授普通 SELECT</dt>
+    <dd>{% for a in confirm_result.granted %}<span class="tag tag-ok">{{ a }}</span>{% else %}<span class="hint">无</span>{% endfor %}</dd>
+    {% if confirm_result.skipped %}
+    <dt>勾选但未补授</dt><dd>{% for a in confirm_result.skipped %}<span class="tag">{{ a }}</span>{% endfor %}<span class="hint">（仍有其他链，独立授权保留）</span></dd>
+    {% endif %}
+    <dt>生效方式</dt><dd>撤权与补授在同一事务提交；任一失败即整体回滚，保留原权限。</dd>
+    <dt>指纹变化</dt><dd class="mono">{{ confirm_result.fingerprint_before[:12] }}… → {{ confirm_result.fingerprint_after[:12] }}…</dd>
+  </dl>
+</section>
+{% endif %}
+
+<section class="panel">
+  <h2>3. 以报表账号实际查表</h2>
+  <table class="tbl">
+    <thead><tr><th>报表账号</th><th>当前状态</th><th>授权链</th><th>试查</th></tr></thead>
+    <tbody>
+    {% for a in state.accounts %}
+      <tr>
+        <td class="mono">{{ a.name }}</td>
+        <td>{% if a.can_read %}<span class="tag tag-ok">可读</span>{% else %}<span class="tag tag-bad">不可读</span>{% endif %}</td>
+        <td>
+          {% for c in a.chains %}<span class="tag tag-warn">链 {{ c }}</span>{% endfor %}
+          {% if a.direct %}<span class="tag">独立授权</span>{% endif %}
+          {% if not a.chains and not a.direct %}<span class="hint">—</span>{% endif %}
+        </td>
+        <td>
+          <form method="post" action="/handover/query" class="inline">
+            <input type="hidden" name="account" value="{{ a.name }}">
+            <button type="submit" class="btn">以该账号查表</button>
+          </form>
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% if query_result %}
+    {% if query_result.ok %}
+    <h4 class="section-title">{{ query_result.account }} 的查询结果（{{ query_result.rows | length }} 行）</h4>
+    <table class="tbl">
+      <thead><tr>{% for c in query_result.columns %}<th>{{ c }}</th>{% endfor %}</tr></thead>
+      <tbody>
+      {% for row in query_result.rows %}
+        <tr>{% for c in query_result.columns %}<td class="mono">{{ row[c] }}</td>{% endfor %}</tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <div class="banner banner-error" style="margin-top:12px">{{ query_result.account }}：{{ query_result.error }}</div>
+    {% endif %}
+  {% endif %}
+  <p class="hint">试查通过 SET ROLE 以该账号真实执行 SELECT，能否查到完全由数据库里的权限裁决；权限存于库内，服务重启后结果不变。</p>
+</section>
+
+<section class="panel">
+  <h2>重置演练</h2>
+  <form method="post" action="/handover/reset"
+        onsubmit="return confirm('将撤掉样例表上全部演练授权（含已完成的交接结果），恢复两笔初始临时授权。继续？');">
+    <div class="controls">
+      <button type="submit" class="btn">恢复初始授权链（重新演练）</button>
+      <span class="hint">仅用于反复演练；正常重启服务不会改动库内权限。</span>
+    </div>
+  </form>
+</section>
+{% else %}
+<section class="panel empty">
+  <p>无法读取授权状态。请确认数据库可用且应用角色有权创建样例角色（CREATEROLE 或超级用户），然后刷新页面。</p>
+</section>
+{% endif %}
+</main>
+</body>
+</html>

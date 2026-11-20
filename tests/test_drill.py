@@ -18,6 +18,7 @@ import time
 import psycopg
 import pytest
 from fastapi.testclient import TestClient
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
 ADMIN_URL = os.environ.get("TEST_DATABASE_URL")
 pytestmark = pytest.mark.skipif(
@@ -34,12 +35,18 @@ def _provision() -> str:
     with psycopg.connect(ADMIN_URL, autocommit=True) as conn:
         conn.execute(f"DROP DATABASE IF EXISTS {DB} WITH (FORCE)")
         try:
-            conn.execute(f"CREATE ROLE {ROLE} LOGIN PASSWORD '{PASSWORD}'")
+            # CREATEROLE: the app seeds the handover drill's sample roles at
+            # startup (docker-compose uses a superuser instead).
+            conn.execute(f"CREATE ROLE {ROLE} LOGIN PASSWORD '{PASSWORD}' CREATEROLE")
         except psycopg.errors.DuplicateObject:
-            pass
+            conn.execute(f"ALTER ROLE {ROLE} CREATEROLE")
         conn.execute(f"CREATE DATABASE {DB} OWNER {ROLE}")
         conn.execute(f"GRANT CREATE, USAGE ON SCHEMA public TO {ROLE}")
-    return ADMIN_URL.replace("/postgres", f"/{DB}", 1)
+    parts = conninfo_to_dict(ADMIN_URL)
+    parts["dbname"] = DB
+    parts["user"] = ROLE
+    parts["password"] = PASSWORD
+    return make_conninfo(**parts)
 
 
 @pytest.fixture(scope="session")

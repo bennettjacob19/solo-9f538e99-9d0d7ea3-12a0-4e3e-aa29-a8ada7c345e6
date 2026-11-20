@@ -136,3 +136,37 @@ main { padding: 20px 28px 60px; max-width: 1180px; margin: 0 auto; }
 
 .hint { color: var(--muted); font-size: 12px; }
 .empty p { color: var(--muted); margin: 0; }
+
+.nav { display: flex; gap: 10px; margin: 4px 0 12px; }
+.nav a {
+  color: var(--muted);
+  text-decoration: none;
+  padding: 4px 12px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  font-size: 13px;
+}
+.nav a:hover { border-color: var(--accent); color: var(--text); }
+.nav a.active { color: var(--text); border-color: var(--accent); background: var(--panel-2); }
+
+.choice {
+  display: block;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin-bottom: 10px;
+  cursor: pointer;
+  font-size: 14px;
+}
+.choice:hover { border-color: var(--accent); }
+.choice.disabled { opacity: .55; cursor: not-allowed; }
+.choice input { margin-right: 8px; }
+
+.chain {
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 5px;
+  font-family: ui-monospace, "SFMono-Regular", "JetBrains Mono", Menlo, monospace;
+}
+
+.section-title { font-size: 14px; margin: 16px 0 10px; }

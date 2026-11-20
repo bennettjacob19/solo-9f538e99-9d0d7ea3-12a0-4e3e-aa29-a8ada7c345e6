@@ -1,7 +1,44 @@
-# PostgreSQL 行锁演练台
+# PostgreSQL 演练台
 
-值班演练页：当一个 `UPDATE` 被 PostgreSQL 行锁挂住时，从网页上找出**真实**的持锁者，
-并只解除本演练造成的这一次阻塞。
+包含两个演练页：
+
+- **行锁演练（`/`）**：当一个 `UPDATE` 被 PostgreSQL 行锁挂住时，从网页上找出**真实**的持锁者，
+  并只解除本演练造成的这一次阻塞。
+- **权限交接（`/handover`）**：临时值班组退出后，接班人仍要查部署报表。撤回选定的临时
+  SELECT 授权（连带依赖它的转授），只给仍需读报表且会失去权限的账号补授。
+
+## 权限交接演练
+
+样例表 `public.deploy_report`（部署报表）与真实角色在首次启动时自动准备，预置两笔
+**可分别撤回**的临时 `SELECT` 授权：
+
+```
+T1（含两级转授）：属主 → duty_alpha ──(WITH GRANT OPTION 转授)──> duty_gamma ──(转授)──> report_alice、report_bob
+T2（一级转授）  ：属主 → duty_beta  ──(WITH GRANT OPTION 转授)──> report_bob、report_carol
+```
+
+因此 `report_alice` 只走 T1 一条授权链，`report_carol` 只走 T2 一条，`report_bob`
+同时走 T1、T2 两条。
+
+交接流程：
+
+1. **选择**：值班员在页面上选定要撤回的一笔临时授权，勾选交接后仍需读报表的账号。
+2. **预演**：页面列出「仅撤权就会失去查询权限的账号」与「本次要补授的账号」
+   （勾选且将失权限者）。预演只读取系统目录，**不修改库内权限**。
+3. **确认**：撤权与补授在**同一事务**生效——
+   - 确认时在事务内复核该表的授权链指纹，指纹与预演不一致（授权链已被改动）即
+     **拒绝交接并提示重新预演**；并发确认由 PostgreSQL 咨询锁串行化，后到者必然
+     看到指纹变化而被拒；
+   - `REVOKE … CASCADE` 撤掉所选授权和依赖它的转授，仅给勾选且将失去读权限的账号
+     补普通 `SELECT`，其余独立授权原样保留；
+   - 任一语句失败即整体回滚，保留原权限。
+4. **验证**：页面上可按样例报表账号实际查表（`SET ROLE` 后真实 `SELECT`），显示
+   结果或权限不足。权限全部落在数据库里，**服务重启后仍按库内权限查询**。
+
+页面另提供「恢复初始授权链」按钮，用于反复演练。应用角色需要能创建样例角色
+（compose 中的 `drill` 为超级用户；自建角色需 `CREATEROLE`）。
+
+## 行锁演练
 
 ## 功能
 
@@ -62,19 +99,26 @@ uvicorn app.main:app --port 8000
 
 ## 测试
 
-测试需要真实 PostgreSQL（会创建 `lock_drill_test` 角色与数据库，请指向一次性实例）：
+测试需要真实 PostgreSQL（会创建 `lock_drill_test` / `lock_handover_test` 角色与数据库，
+请指向一次性实例）：
 
 ```bash
 TEST_DATABASE_URL=postgresql://postgres@localhost/postgres pytest -q
 ```
 
-覆盖：真实阻塞关系、正常解锁恢复、服务重启后的旧页面、结束演练后的旧页面、
+行锁演练覆盖：真实阻塞关系、正常解锁恢复、服务重启后的旧页面、结束演练后的旧页面、
 会话身份被篡改（拒绝终止且不释放锁）、终止成功但无提交结果（判未恢复）、
 旧会话已消失但更新已提交（按真实结果判恢复）、重复解锁幂等。
 
+权限交接覆盖：初始授权链形态（两级转授、单链/双链账号）、预演只读且列出失权与补授账号、
+撤 T1/T2 后链与独立授权的去留、未勾选账号真实失去查询权限、指纹过期拒绝且不改权限、
+并发确认只有一笔生效、补授失败整体回滚、服务重启后仍按库内权限查询、试查接口的账号白名单。
+
 ## 接口
 
-- `GET /`、`POST /drill/start`、`GET /drill/{id}`
-- `POST /drill/{id}/release`、`POST /drill/{id}/end`（表单，含 `token`）
-- `GET /api/state`、`GET /api/drills/{id}`、`POST /api/drills/{id}/release|end`（JSON）
+- 行锁演练：`GET /`、`POST /drill/start`、`GET /drill/{id}`、
+  `POST /drill/{id}/release`、`POST /drill/{id}/end`（表单，含 `token`）；
+  `GET /api/state`、`GET /api/drills/{id}`、`POST /api/drills/{id}/release|end`（JSON）
+- 权限交接：`GET /handover`、`POST /handover/preview|confirm|query|reset`（表单）；
+  `GET /api/handover/state`、`POST /api/handover/preview|confirm|query|reset`（JSON）
 - `GET /healthz`

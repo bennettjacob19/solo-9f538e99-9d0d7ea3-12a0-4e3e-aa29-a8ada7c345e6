@@ -1,4 +1,4 @@
-"""FastAPI application for the PostgreSQL row-lock drill."""
+"""FastAPI application for the PostgreSQL drills (row-lock and permission handover)."""
 
 from __future__ import annotations
 
@@ -13,9 +13,11 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+from . import grants
 from .config import settings
 from .db import connect, ensure_schema
 from .drill import DrillError, store
+from .grants import HandoverError
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -32,6 +34,7 @@ async def lifespan(_app: FastAPI):
     for attempt in range(1, 31):
         try:
             ensure_schema()
+            grants.ensure_handover_schema()
             logger.info("drill schema ready")
             break
         except Exception as exc:  # database may still be starting
@@ -64,11 +67,11 @@ async def lifespan(_app: FastAPI):
         store.shutdown()
 
 
-app = FastAPI(title="PostgreSQL 行锁演练台", lifespan=lifespan)
+app = FastAPI(title="PostgreSQL 演练台", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
 
 
-def _json_error(exc: DrillError) -> JSONResponse:
+def _json_error(exc: Exception) -> JSONResponse:
     return JSONResponse(
         {"ok": False, "error": str(exc), "kind": type(exc).__name__},
         status_code=getattr(exc, "status_code", 400),
@@ -213,3 +216,156 @@ async def healthz() -> JSONResponse:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=503)
     active = store.active()
     return JSONResponse({"ok": True, "active_drill_id": active.id if active else None})
+
+
+# ---------------------------------------------------------------------------
+# 权限交接演练（页面）
+# ---------------------------------------------------------------------------
+
+
+def _render_handover(
+    request: Request,
+    *,
+    message: str | None = None,
+    error: str | None = None,
+    preview: dict[str, Any] | None = None,
+    confirm_result: dict[str, Any] | None = None,
+    query_result: dict[str, Any] | None = None,
+    selection: dict[str, Any] | None = None,
+    status_code: int = 200,
+) -> HTMLResponse:
+    try:
+        state = grants.read_state()
+    except Exception as exc:
+        state = None
+        if error is None:
+            error = f"读取授权状态失败：{type(exc).__name__}: {exc}"
+    context: dict[str, Any] = {
+        "request": request,
+        "state": state,
+        "message": message,
+        "error": error,
+        "preview": preview,
+        "confirm_result": confirm_result,
+        "query_result": query_result,
+        "selection": selection or {},
+    }
+    return templates.TemplateResponse(request, "handover.html", context, status_code=status_code)
+
+
+@app.get("/handover", response_class=HTMLResponse)
+async def handover_page(request: Request) -> HTMLResponse:
+    return _render_handover(request)
+
+
+@app.post("/handover/preview", response_class=HTMLResponse)
+async def handover_preview_form(
+    request: Request,
+    grant_id: str = Form(...),
+    checked: list[str] = Form(default=[]),
+) -> HTMLResponse:
+    selection = {"grant_id": grant_id, "checked": checked}
+    try:
+        result = grants.preview(grant_id, checked)
+    except HandoverError as exc:
+        return _render_handover(
+            request, error=str(exc), selection=selection, status_code=exc.status_code
+        )
+    return _render_handover(
+        request,
+        preview=result,
+        selection=selection,
+        message="预演完成：以下结果仅基于当前库内授权链推算，未修改任何权限。",
+    )
+
+
+@app.post("/handover/confirm", response_class=HTMLResponse)
+async def handover_confirm_form(
+    request: Request,
+    grant_id: str = Form(...),
+    fingerprint: str = Form(...),
+    checked: list[str] = Form(default=[]),
+) -> HTMLResponse:
+    try:
+        result = grants.confirm(grant_id, checked, fingerprint)
+    except HandoverError as exc:
+        return _render_handover(request, error=str(exc), status_code=exc.status_code)
+    return _render_handover(
+        request,
+        confirm_result=result,
+        message="交接完成：撤权与补授已在同一事务生效。",
+    )
+
+
+@app.post("/handover/query", response_class=HTMLResponse)
+async def handover_query_form(request: Request, account: str = Form(...)) -> HTMLResponse:
+    try:
+        result = grants.try_query(account)
+    except HandoverError as exc:
+        return _render_handover(request, error=str(exc), status_code=exc.status_code)
+    return _render_handover(request, query_result=result)
+
+
+@app.post("/handover/reset", response_class=HTMLResponse)
+async def handover_reset_form(request: Request) -> HTMLResponse:
+    try:
+        grants.reset_handover()
+    except HandoverError as exc:
+        return _render_handover(request, error=str(exc), status_code=exc.status_code)
+    return _render_handover(request, message="已恢复初始授权链，可重新开始演练。")
+
+
+# ---------------------------------------------------------------------------
+# 权限交接演练（JSON API）
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/handover/state", response_class=JSONResponse)
+async def api_handover_state() -> JSONResponse:
+    try:
+        state = grants.read_state()
+    except HandoverError as exc:
+        return _json_error(exc)
+    return JSONResponse({"ok": True, "state": state})
+
+
+@app.post("/api/handover/preview", response_class=JSONResponse)
+async def api_handover_preview(
+    grant_id: str = Form(...), checked: list[str] = Form(default=[])
+) -> JSONResponse:
+    try:
+        result = grants.preview(grant_id, checked)
+    except HandoverError as exc:
+        return _json_error(exc)
+    return JSONResponse({"ok": True, "preview": result})
+
+
+@app.post("/api/handover/confirm", response_class=JSONResponse)
+async def api_handover_confirm(
+    grant_id: str = Form(...),
+    fingerprint: str = Form(...),
+    checked: list[str] = Form(default=[]),
+) -> JSONResponse:
+    try:
+        result = grants.confirm(grant_id, checked, fingerprint)
+    except HandoverError as exc:
+        return _json_error(exc)
+    return JSONResponse({"ok": True, "result": result})
+
+
+@app.post("/api/handover/query", response_class=JSONResponse)
+async def api_handover_query(account: str = Form(...)) -> JSONResponse:
+    try:
+        result = grants.try_query(account)
+    except HandoverError as exc:
+        return _json_error(exc)
+    return JSONResponse({"ok": True, "query": result})
+
+
+@app.post("/api/handover/reset", response_class=JSONResponse)
+async def api_handover_reset() -> JSONResponse:
+    try:
+        state = grants.reset_handover()
+    except HandoverError as exc:
+        return _json_error(exc)
+    return JSONResponse({"ok": True, "state": state})
